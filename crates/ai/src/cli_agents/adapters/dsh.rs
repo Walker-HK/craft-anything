@@ -227,7 +227,9 @@ fn desktop_models(patch: &str) -> Vec<String> {
 ///
 /// An entry starts at the list's own indentation, which YAML lets sit anywhere, and runs until the
 /// next one: a line at that indentation opening an entry, or anything less indented (a comment, or
-/// the end). A deeper line belongs to the entry.
+/// the end). A deeper line belongs to the entry. Whether an entry is a provider is read from its
+/// own mapping, as [`desktop_models`] reads it, so the two always agree on what a provider entry is:
+/// `name` before `id`, a `-` on a line of its own and any indentation all select the same entries.
 fn provider_entries(patch: &str) -> String {
     let lines: Vec<&str> = patch.lines().map(|l| l.trim_end_matches('\r')).collect();
     // The list's indentation: the least that opens an entry, so a patch indented as a whole still
@@ -257,20 +259,19 @@ fn provider_entries(patch: &str) -> String {
         }
         // Anything else sits outside the list: a comment above or below it, which belongs to no entry.
     }
-    let is_provider = |e: &&Vec<&str>| {
-        e.iter().any(|l| {
-            l.trim_start()
-                .strip_prefix('-')
-                .unwrap_or_default()
-                .trim_start()
-                .strip_prefix("id:")
-                .is_some_and(|id| id.trim().trim_matches(['"', '\'']).starts_with("llm-"))
-        })
-    };
     // Written back at this overlay's own indentation (none), since it sits in the same list as the
     // entries we add; the entry's own shape, and its comments, stay as they were.
     let dedent = |l: &str| l.get(base.min(l.len())..).unwrap_or_default().to_string();
-    entries.iter().filter(is_provider).map(|e| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n") + "\n").collect()
+    let entry_text = |e: &Vec<&str>| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n");
+    // An entry is a sequence item on its own, so it parses as a one-item document, and its `id` is
+    // the entry's own top-level key rather than whichever line came first. Unindented first: a
+    // top-level sequence has to start at the margin to parse at all.
+    let is_provider = |text: &str| {
+        let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(text) else { return false };
+        let item = docs.first().and_then(yaml_rust2::Yaml::as_vec).and_then(|items| items.first());
+        item.is_some_and(|item| item["id"].as_str().is_some_and(|id| id.starts_with("llm-")))
+    };
+    entries.iter().map(entry_text).filter(|text| is_provider(text)).map(|text| text + "\n").collect()
 }
 
 /// The overlay in the harness's patch format: a list of loader entries. It inserts our tool server,
@@ -494,6 +495,30 @@ mod tests {
             let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
             assert!(ids.contains(&"llm-pi-ai"), "the provider entry is copied: {y}");
             assert!(!ids.contains(&"web"), "other entries stay behind: {y}");
+        }
+    }
+
+    /// Which entry is a provider is decided by its own `id` key, so the same entry is copied
+    /// whether `name` comes before `id` or the dash stands on a line of its own: the two halves of
+    /// this adapter must never disagree about what a provider entry is.
+    #[test]
+    fn provider_entries_are_chosen_by_their_id_key_not_the_line_order() {
+        for provider in [
+            // `id` first, sharing the dash, as the desktop app writes it.
+            "- id: llm-pi-ai\n  config:\n    providers:\n      claude:\n        models:\n          - id: claude-x\n",
+            // `name` before `id`, the order this repo's own patch uses.
+            "- name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  id: llm-pi-ai\n  config:\n    providers:\n      claude:\n        models:\n          - id: claude-x\n",
+            // The dash alone, so the mapping starts on the next line.
+            "-\n  id: llm-pi-ai\n  config:\n    providers:\n      claude:\n        models:\n          - id: claude-x\n",
+        ] {
+            let patch = format!("{provider}- id: web\n  config:\n    searchProvider: tavily\n");
+            let models = desktop_models(&patch);
+            assert!(models.iter().any(|m| m == "claude/claude-x"), "listed: {models:?} from {patch:?}");
+            let y = overlay_yaml(None, Some("claude/claude-x"), &patch);
+            let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+            let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+            assert!(ids.contains(&"llm-pi-ai"), "the provider its models came from is copied too: {y}");
+            assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
         }
     }
 }
