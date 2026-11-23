@@ -52,9 +52,15 @@ impl AgentAdapter for DeepSeekHarness {
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
         let mut v = cx.options.args.clone();
         v.extend(["--profile".into(), "headless".into()]);
-        // A question about a build may only read the project's files, so it gets no tool server.
+        // A question about a build may only read the project's files, so it gets no tool server, and
+        // no model overlay either: the overlay is a file on this computer, and this adapter can't
+        // tell from here whether the run is on another one (an SSH backend's `ssh_host` isn't in
+        // `ArgsCx`). A question therefore behaves exactly as before a model could be chosen. It
+        // costs nothing today: questions go only to adapters that say they `answers_questions`, and
+        // this one doesn't, so the runner stops before it builds these arguments.
         let mcp = (!cx.question).then_some(cx.mcp);
-        let model = cx.options.cli_model.as_deref().filter(|m| !m.trim().is_empty() && *m != crate::anthropic::CLAUDE_CODE_DEFAULT);
+        let model =
+            (!cx.question).then_some(cx.options.cli_model.as_deref()).flatten().filter(|m| !m.trim().is_empty() && *m != crate::anthropic::CLAUDE_CODE_DEFAULT);
         if mcp.is_some() || model.is_some() {
             let desktop = model.map(|_| read_desktop_patch().unwrap_or_default()).unwrap_or_default();
             v.extend(["--patch".into(), run_patch(&overlay_yaml(mcp, model, &desktop))]);
@@ -218,28 +224,53 @@ fn desktop_models(patch: &str) -> Vec<String> {
 
 /// The desktop layer's provider entries (ids starting `llm-`), as written, so the headless run
 /// knows the same providers.
+///
+/// An entry starts at the list's own indentation, which YAML lets sit anywhere, and runs until the
+/// next one: a line at that indentation opening an entry, or anything less indented (a comment, or
+/// the end). A deeper line belongs to the entry.
 fn provider_entries(patch: &str) -> String {
-    let mut blocks: Vec<Vec<&str>> = Vec::new();
-    let mut open = false;
-    for line in patch.lines().map(|l| l.trim_end_matches('\r')) {
-        if line.starts_with("- ") || line == "-" {
-            blocks.push(vec![line]);
-            open = true;
-        } else if line.starts_with(' ') || line.is_empty() {
-            if open && let Some(b) = blocks.last_mut() {
-                b.push(line);
-            }
-        } else {
-            open = false;
+    let lines: Vec<&str> = patch.lines().map(|l| l.trim_end_matches('\r')).collect();
+    // The list's indentation: the least that opens an entry, so a patch indented as a whole still
+    // finds its entries. None: no entry at all, so there's nothing to copy.
+    let indent = |l: &str| l.len() - l.trim_start_matches(' ').len();
+    let Some(base) = lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim_start();
+            t == "-" || t.starts_with("- ")
+        })
+        .map(|l| indent(l))
+        .min()
+    else {
+        return String::new();
+    };
+    let mut entries: Vec<Vec<&str>> = Vec::new();
+    for line in &lines {
+        let t = line.trim_start();
+        let at_entry = indent(line) == base && (t == "-" || t.starts_with("- "));
+        if at_entry {
+            entries.push(vec![line]);
+        } else if indent(line) > base
+            && let Some(last) = entries.last_mut()
+        {
+            last.push(line);
         }
+        // Anything else sits outside the list: a comment above or below it, which belongs to no entry.
     }
-    let is_provider = |b: &&Vec<&str>| {
-        b.iter().any(|l| {
-            let l = l.strip_prefix("- ").or_else(|| l.strip_prefix("  ")).unwrap_or_default();
-            l.strip_prefix("id:").is_some_and(|id| id.trim().trim_matches(['"', '\'']).starts_with("llm-"))
+    let is_provider = |e: &&Vec<&str>| {
+        e.iter().any(|l| {
+            l.trim_start()
+                .strip_prefix('-')
+                .unwrap_or_default()
+                .trim_start()
+                .strip_prefix("id:")
+                .is_some_and(|id| id.trim().trim_matches(['"', '\'']).starts_with("llm-"))
         })
     };
-    blocks.iter().filter(is_provider).map(|b| b.join("\n") + "\n").collect()
+    // Written back at this overlay's own indentation (none), since it sits in the same list as the
+    // entries we add; the entry's own shape, and its comments, stay as they were.
+    let dedent = |l: &str| l.get(base.min(l.len())..).unwrap_or_default().to_string();
+    entries.iter().filter(is_provider).map(|e| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n") + "\n").collect()
 }
 
 /// The overlay in the harness's patch format: a list of loader entries. It inserts our tool server,
@@ -443,13 +474,26 @@ mod tests {
         assert_eq!(default["config"]["model"].as_str(), Some("meta/muse"));
     }
 
-    /// A question with a chosen model still gets the model, though no tool server.
+    /// A chosen model never puts an overlay on a question's command line, so no path written here
+    /// can reach a harness that runs on another computer.
     #[test]
-    fn question_with_model_gets_a_patch_without_tool_server() {
+    fn a_question_gets_no_model_overlay_even_when_one_is_chosen() {
         let options = BackendOptions { cli_model: Some("deepseek-official/deepseek-v4-pro".into()), ..Default::default() };
         let (argv, _) = args(&options, true);
-        let patch = argv.iter().position(|a| a == "--patch").map(|i| &argv[i + 1]).expect("a patch");
-        let y = std::fs::read_to_string(patch).expect("overlay written");
-        assert!(y.contains("deepseek-v4-pro") && !y.contains(OVERLAY_ID), "{y}");
+        assert_eq!(argv, ["--profile", "headless"], "a question is unchanged by a chosen model: {argv:?}");
+    }
+
+    /// A provider entry is found however the list is indented, and only the providers are copied.
+    #[test]
+    fn provider_entries_follow_the_lists_indentation() {
+        // The same layer indented as a whole, as a person (or an editor) may leave it.
+        let indented: String = DESKTOP.lines().map(|l| format!("  {l}\n")).collect();
+        for patch in [DESKTOP.to_string(), indented] {
+            let y = overlay_yaml(None, Some("claude/claude-x"), &patch);
+            let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{patch:?}"));
+            let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+            assert!(ids.contains(&"llm-pi-ai"), "the provider entry is copied: {y}");
+            assert!(!ids.contains(&"web"), "other entries stay behind: {y}");
+        }
     }
 }
