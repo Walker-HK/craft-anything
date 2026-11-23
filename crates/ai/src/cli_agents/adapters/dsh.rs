@@ -262,16 +262,36 @@ fn provider_entries(patch: &str) -> String {
     // Written back at this overlay's own indentation (none), since it sits in the same list as the
     // entries we add; the entry's own shape, and its comments, stay as they were.
     let dedent = |l: &str| l.get(base.min(l.len())..).unwrap_or_default().to_string();
-    let entry_text = |e: &Vec<&str>| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n");
-    // An entry is a sequence item on its own, so it parses as a one-item document, and its `id` is
-    // the entry's own top-level key rather than whichever line came first. Unindented first: a
-    // top-level sequence has to start at the margin to parse at all.
-    let is_provider = |text: &str| {
-        let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(text) else { return false };
-        let item = docs.first().and_then(yaml_rust2::Yaml::as_vec).and_then(|items| items.first());
-        item.is_some_and(|item| item["id"].as_str().is_some_and(|id| id.starts_with("llm-")))
+    let texts: Vec<String> = entries.iter().map(|e| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n")).collect();
+    // Which entry is a provider is read from the whole document, not one entry at a time: an entry
+    // may use an anchor an earlier one defined (`{api: &api …}` then `{api: *api}`), and a parser
+    // handed that entry alone rejects the unknown anchor, which would silently leave out the very
+    // provider its models were listed from.
+    let document = lines.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n");
+    let ids: Vec<String> = yaml_rust2::YamlLoader::load_from_str(&document)
+        .ok()
+        .and_then(|docs| {
+            docs.first().and_then(yaml_rust2::Yaml::as_vec).map(|items| items.iter().map(|i| i["id"].as_str().unwrap_or_default().to_string()).collect())
+        })
+        .unwrap_or_default();
+    // The text split and the parsed document name the same entries whenever the split is right. When
+    // their counts differ the split and the parser disagree, so each entry is read on its own again:
+    // that still finds a self-contained one, and never pairs an entry with another's id.
+    let aligned = ids.len() == texts.len();
+    let is_provider = |i: usize, text: &str| {
+        let id = match ids.get(i).filter(|_| aligned) {
+            Some(id) => id.clone(),
+            None => yaml_rust2::YamlLoader::load_from_str(text)
+                .ok()
+                .and_then(|docs| {
+                    docs.first().and_then(yaml_rust2::Yaml::as_vec).and_then(|items| items.first()).and_then(|item| item["id"].as_str()).map(str::to_string)
+                })
+                .unwrap_or_default(),
+        };
+        id.starts_with("llm-")
     };
-    entries.iter().map(entry_text).filter(|text| is_provider(text)).map(|text| text + "\n").collect()
+    // Copied in source order, so an anchor and the entry that declares it stay in that order.
+    texts.iter().enumerate().filter(|(i, text)| is_provider(*i, text)).map(|(_, text)| text.clone() + "\n").collect()
 }
 
 /// The overlay in the harness's patch format: a list of loader entries. It inserts our tool server,
@@ -520,5 +540,30 @@ mod tests {
             assert!(ids.contains(&"llm-pi-ai"), "the provider its models came from is copied too: {y}");
             assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
         }
+    }
+
+    /// An entry may take a value from an anchor an earlier entry declared. A parser handed that
+    /// entry alone rejects the unknown anchor, so the copy must read the whole layer: otherwise the
+    /// second provider is left out while its models are still offered, and a run choosing one has
+    /// no provider to resolve it with.
+    #[test]
+    fn a_provider_using_an_earlier_entrys_anchor_is_still_copied() {
+        let patch = "- id: llm-one\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      first: {api: &api openai-completions, baseURL: 'http://127.0.0.1:1/v1', models: [{id: one}]}\n\
+                     - id: llm-two\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      second: {api: *api, baseURL: 'http://127.0.0.1:2/v1', models: [{id: two}]}\n\
+                     - id: web\n  config:\n    searchProvider: tavily\n";
+        // Both entries are offered, so choosing either has to bring its provider along.
+        let models = desktop_models(patch);
+        for m in ["first/one", "second/two"] {
+            assert!(models.iter().any(|x| x == m), "{m} is offered: {models:?}");
+        }
+        let y = overlay_yaml(None, Some("second/two"), patch);
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+        let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"llm-one") && ids.contains(&"llm-two"), "both providers, the anchor's and its user's: {y}");
+        assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
+        // Source order, so the anchor is still declared before the entry that uses it.
+        let first = ids.iter().position(|id| *id == "llm-one").expect("llm-one");
+        let second = ids.iter().position(|id| *id == "llm-two").expect("llm-two");
+        assert!(first < second, "the entry declaring the anchor comes first: {y}");
     }
 }
