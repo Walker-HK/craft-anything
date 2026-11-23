@@ -294,7 +294,47 @@ fn provider_entries(patch: &str) -> String {
         id.starts_with("llm-")
     };
     // Copied in source order, so an anchor and the entry that declares it stay in that order.
-    texts.iter().enumerate().filter(|(i, text)| is_provider(*i, text)).map(|(_, text)| text.clone() + "\n").collect()
+    //
+    // An anchor a provider uses may be declared by an entry that isn't one. Copying the provider
+    // alone would then leave `*api` with nothing to resolve, and the harness refuses the overlay
+    // outright (`found unknown anchor`), while `desktop_models` still offered that model. So an
+    // entry declaring an anchor a copied provider uses, without declaring it itself, is copied too.
+    // It is a provider in all but name at that point: leaving it out is what breaks the run.
+    let providers: Vec<usize> = texts.iter().enumerate().filter(|(i, text)| is_provider(*i, text)).map(|(i, _)| i).collect();
+    let missing = |i: usize| -> Vec<String> {
+        let owned = anchors_declared_in(&texts[i]);
+        aliases_used_in(&texts[i]).into_iter().filter(|a| !owned.contains(a)).collect()
+    };
+    let wanted: std::collections::HashSet<String> = providers.iter().flat_map(|i| missing(*i)).collect();
+    let keeps = |i: usize| providers.contains(&i) || (!wanted.is_empty() && anchors_declared_in(&texts[i]).iter().any(|a| wanted.contains(a)));
+    texts.iter().enumerate().filter(|(i, _)| keeps(*i)).map(|(_, text)| text.clone() + "\n").collect()
+}
+
+/// The anchors an entry declares (`&api`, `&base`), by name.
+fn anchors_declared_in(text: &str) -> Vec<String> {
+    name_after(text, '&')
+}
+
+/// The names an entry takes values from (`*api`), by name.
+fn aliases_used_in(text: &str) -> Vec<String> {
+    name_after(text, '*')
+}
+
+/// Every name written after `sigil`, in order, without repeats. Scanning the text is enough here
+/// because the question is only which entry mentions which name; a name a quoted string happens to
+/// contain names an anchor the patch has to declare anyway, so copying that entry stays right.
+fn name_after(text: &str, sigil: char) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(sigil) {
+        rest = &rest[at + sigil.len_utf8()..];
+        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name.clone());
+        }
+        rest = &rest[name.len()..];
+    }
+    out
 }
 
 /// The overlay in the harness's patch format: a list of loader entries. It inserts our tool server,
@@ -608,5 +648,42 @@ mod tests {
         // Written back at the overlay's own indentation, so the copied entries are siblings.
         let copied = y.split("- id: llm-one").nth(1).expect("the copied provider");
         assert!(copied.lines().next().is_some_and(|l| !l.starts_with(' ')), "not nested under the entry above: {y}");
+    }
+
+    /// An anchor a provider uses may be declared by an entry that isn't a provider. Copying the
+    /// provider without that entry leaves `*api` undefined, and the harness refuses the overlay
+    /// (`found unknown anchor`) while the model was offered. The declaring entry has to come too,
+    /// or choosing that model builds an overlay that can't start.
+    #[test]
+    fn a_provider_using_an_excluded_entrys_anchor_brings_it_along() {
+        let patch = [
+            "- id: web",
+            "  config:",
+            "    api: &api openai-completions",
+            "    searchProvider: tavily",
+            "- id: llm-pi-ai",
+            "  name: \"@deepseek-ai/dsh-llm-pi-ai\"",
+            "  config:",
+            "    providers:",
+            "      custom:",
+            "        api: *api",
+            "        models: [{id: custom-model}]",
+            "",
+        ]
+        .join("\n");
+        assert!(desktop_models(&patch).iter().any(|m| m == "custom/custom-model"), "the model is offered");
+        let y = overlay_yaml(None, Some("custom/custom-model"), &patch);
+        // The overlay has to parse: that is the failure this guards against.
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+        let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"web") && ids.contains(&"llm-pi-ai"), "the declaring entry comes along: {y}");
+        // The declaring entry is copied whole rather than line by line: dropping the lines that
+        // don't declare the anchor would mean editing another person's YAML entry by guesswork,
+        // and a key we cut is a key the harness then misses. Its settings are inert here.
+        assert!(!ids.contains(&"agent-default-model") || y.contains("agent-default-model"), "{y}");
+        // The anchor is declared before the entry that uses it, or the parser would still refuse it.
+        let declared = y.find("&api").expect("the anchor");
+        let used = y.find("*api").expect("the alias");
+        assert!(declared < used, "the declaration comes first: {y}");
     }
 }
