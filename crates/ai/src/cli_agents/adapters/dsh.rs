@@ -227,9 +227,10 @@ fn desktop_models(patch: &str) -> Vec<String> {
 ///
 /// An entry starts at the list's own indentation, which YAML lets sit anywhere, and runs until the
 /// next one: a line at that indentation opening an entry, or anything less indented (a comment, or
-/// the end). A deeper line belongs to the entry. Whether an entry is a provider is read from its
-/// own mapping, as [`desktop_models`] reads it, so the two always agree on what a provider entry is:
-/// `name` before `id`, a `-` on a line of its own and any indentation all select the same entries.
+/// the end). A deeper line belongs to the entry. Whether an entry is a provider is read from the
+/// patch's own parsed entries, as [`desktop_models`] reads it, so the two always agree on what a
+/// provider entry is: `name` before `id`, a `-` on a line of its own, any indentation, a
+/// column-zero comment above the list and an anchor declared by an earlier entry all behave.
 fn provider_entries(patch: &str) -> String {
     let lines: Vec<&str> = patch.lines().map(|l| l.trim_end_matches('\r')).collect();
     // The list's indentation: the least that opens an entry, so a patch indented as a whole still
@@ -260,15 +261,17 @@ fn provider_entries(patch: &str) -> String {
         // Anything else sits outside the list: a comment above or below it, which belongs to no entry.
     }
     // Written back at this overlay's own indentation (none), since it sits in the same list as the
-    // entries we add; the entry's own shape, and its comments, stay as they were.
+    // entries we add; the entry's own shape, and its comments, stay as they were. Only the entries
+    // are dedented: a line outside the list keeps every character it had.
     let dedent = |l: &str| l.get(base.min(l.len())..).unwrap_or_default().to_string();
     let texts: Vec<String> = entries.iter().map(|e| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n")).collect();
-    // Which entry is a provider is read from the whole document, not one entry at a time: an entry
-    // may use an anchor an earlier one defined (`{api: &api …}` then `{api: *api}`), and a parser
-    // handed that entry alone rejects the unknown anchor, which would silently leave out the very
-    // provider its models were listed from.
-    let document = lines.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n");
-    let ids: Vec<String> = yaml_rust2::YamlLoader::load_from_str(&document)
+    // Which entry is a provider is read from the whole patch as it was written, not one entry at a
+    // time: an entry may use an anchor an earlier one defined (`{api: &api …}` then `{api: *api}`),
+    // and a parser handed that entry alone rejects the unknown anchor, which would silently leave
+    // out the very provider its models were listed from. The patch is parsed as given because it is
+    // already a valid document: dedenting it would also strip a column-zero comment's `#` when the
+    // list is indented, which breaks the parse and takes the anchors with it.
+    let ids: Vec<String> = yaml_rust2::YamlLoader::load_from_str(patch)
         .ok()
         .and_then(|docs| {
             docs.first().and_then(yaml_rust2::Yaml::as_vec).map(|items| items.iter().map(|i| i["id"].as_str().unwrap_or_default().to_string()).collect())
@@ -565,5 +568,45 @@ mod tests {
         let first = ids.iter().position(|id| *id == "llm-one").expect("llm-one");
         let second = ids.iter().position(|id| *id == "llm-two").expect("llm-two");
         assert!(first < second, "the entry declaring the anchor comes first: {y}");
+    }
+
+    /// The three awkward shapes at once: the list indented, a column-zero comment above it, and the
+    /// second provider taking the first's anchor. The patch is read as written for the ids, so the
+    /// comment keeps its `#` and the anchors still resolve; dedenting a line outside the list would
+    /// turn `# desktop` into `desktop` and take the whole classification down with it.
+    #[test]
+    fn an_indented_list_under_a_column_zero_comment_keeps_its_anchors() {
+        // Written one line at a time, so the indentation is exactly what the test means: a comment
+        // at the margin, then the list two spaces in.
+        let patch = [
+            "# desktop profile",
+            "  - id: llm-one",
+            "    name: \"@deepseek-ai/dsh-llm-pi-ai\"",
+            "    config:",
+            "      providers:",
+            "        first: {api: &api openai-completions, models: [{id: one}]}",
+            "  - id: llm-two",
+            "    name: \"@deepseek-ai/dsh-llm-pi-ai\"",
+            "    config:",
+            "      providers:",
+            "        second: {api: *api, models: [{id: two}]}",
+            "  - id: web",
+            "    config:",
+            "      searchProvider: tavily",
+            "",
+        ]
+        .join("\n");
+        let models = desktop_models(&patch);
+        for m in ["first/one", "second/two"] {
+            assert!(models.iter().any(|x| x == m), "{m} is offered: {models:?}");
+        }
+        let y = overlay_yaml(None, Some("second/two"), &patch);
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+        let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"llm-one") && ids.contains(&"llm-two"), "both providers survive the comment: {y}");
+        assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
+        // Written back at the overlay's own indentation, so the copied entries are siblings.
+        let copied = y.split("- id: llm-one").nth(1).expect("the copied provider");
+        assert!(copied.lines().next().is_some_and(|l| !l.starts_with(' ')), "not nested under the entry above: {y}");
     }
 }
