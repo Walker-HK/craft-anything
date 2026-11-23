@@ -12,6 +12,12 @@
 //! folder can't be used to reach it.
 //! Its headless profile keeps no session to continue, so a build that stops starts again from the
 //! brief (as it does with the plain adapter).
+//!
+//! A model is chosen here too, though the headless profile takes no `--model`: the list is what the
+//! person set up in their desktop Harness profile (`profiles/desktop/cordis.patch.yml` under
+//! `$DSH_HOME`), and a chosen model travels in the same overlay, which also turns the saved-key
+//! store back on (the headless bundle leaves it off, so a key saved in the app is never seen) and
+//! borrows those providers' settings, so a run uses what the desktop app already uses.
 
 use super::*;
 
@@ -47,8 +53,11 @@ impl AgentAdapter for DeepSeekHarness {
         let mut v = cx.options.args.clone();
         v.extend(["--profile".into(), "headless".into()]);
         // A question about a build may only read the project's files, so it gets no tool server.
-        if !cx.question {
-            v.extend(["--patch".into(), tool_server_patch(cx.mcp)]);
+        let mcp = (!cx.question).then_some(cx.mcp);
+        let model = cx.options.cli_model.as_deref().filter(|m| !m.trim().is_empty() && *m != crate::anthropic::CLAUDE_CODE_DEFAULT);
+        if mcp.is_some() || model.is_some() {
+            let desktop = model.map(|_| read_desktop_patch().unwrap_or_default()).unwrap_or_default();
+            v.extend(["--patch".into(), run_patch(&overlay_yaml(mcp, model, &desktop))]);
         }
         // No task positional means stdin. Unlike `-`, this fails as a missing task on older
         // Harness versions without stdin support, rather than submitting a literal dash.
@@ -68,6 +77,29 @@ impl AgentAdapter for DeepSeekHarness {
     /// failed flag check keeps this adapter rather than falling back to the plain one.
     fn plain_fallback(&self) -> bool {
         false
+    }
+
+    fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
+        Some(options.and_then(|options| options.cli_model.clone()).unwrap_or_else(|| "DeepSeek Harness default".into()))
+    }
+
+    /// The models set up in the person's desktop Harness profile, as `provider/model`, after the
+    /// headless profile's own default and the built-in DeepSeek models.
+    fn model_choices(&self, config: &BackendConfig, _options: &BackendOptions) -> Result<Vec<String>, ToolError> {
+        let mut models = vec![crate::anthropic::CLAUDE_CODE_DEFAULT.to_string()];
+        // A harness on another machine keeps its profile there, out of reach of this list.
+        let local = config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
+        if local && let Some(text) = read_desktop_patch() {
+            models.extend(desktop_models(&text));
+        }
+        models.extend(BUILT_IN_MODELS.iter().map(|m| m.to_string()));
+        let mut seen = std::collections::HashSet::new();
+        models.retain(|m| seen.insert(m.clone()));
+        Ok(models)
+    }
+
+    fn offers_own_default(&self) -> bool {
+        true
     }
 
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
@@ -124,10 +156,10 @@ fn private_dir() -> std::fs::DirBuilder {
 /// a path that isn't there, so the run fails at startup instead of building without the tool server
 /// it was promised; [`check_tool_server`](AgentAdapter::check_tool_server) reports the everyday
 /// causes first, with a fix.
-fn tool_server_patch(mcp: &McpCommand) -> String {
+fn run_patch(yaml: &str) -> String {
     let Ok(dir) = overlay_dir() else { return missing_overlay() };
     let path = dir.join(OVERLAY_FILE);
-    match craft_anything_platform::write_atomic_private(&path, overlay_yaml(mcp).as_bytes()) {
+    match craft_anything_platform::write_atomic_private(&path, yaml.as_bytes()) {
         Ok(()) => path.display().to_string(),
         Err(e) => {
             log::warn!("the DeepSeek Harness tool-server overlay couldn't be written: {}", e.message);
@@ -141,23 +173,109 @@ fn missing_overlay() -> String {
     std::env::temp_dir().join(format!("craft-anything-dsh-{}-missing.yml", std::process::id())).display().to_string()
 }
 
-/// The overlay in the harness's patch format: a list of loader entries, one server inserted.
-fn overlay_yaml(mcp: &McpCommand) -> String {
+/// Models every Harness ships with, as `provider/model`.
+const BUILT_IN_MODELS: &[&str] = &["deepseek-official/deepseek-flash", "deepseek-official/deepseek-v4-pro"];
+
+/// The person's desktop profile patch layer (`$DSH_HOME/profiles/desktop/cordis.patch.yml`), where
+/// the desktop app saves the model providers set up in it.
+fn read_desktop_patch() -> Option<String> {
+    let home = std::env::var_os("DSH_HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".dsh")))?;
+    let text = std::fs::read_to_string(home.join("profiles").join("desktop").join("cordis.patch.yml")).ok()?;
+    Some(text.trim_start_matches('\u{feff}').to_string())
+}
+
+/// `provider/model` for each model a desktop patch layer names: the providers' model lists, the
+/// default model and the models allowed for helpers.
+fn desktop_models(patch: &str) -> Vec<String> {
+    use yaml_rust2::{Yaml, YamlLoader};
+    let Ok(docs) = YamlLoader::load_from_str(patch) else { return Vec::new() };
+    let Some(Yaml::Array(entries)) = docs.into_iter().next() else { return Vec::new() };
+    let pair = |e: &Yaml| match (e["provider"].as_str(), e["model"].as_str()) {
+        (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => Some(format!("{p}/{m}")),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for e in &entries {
+        let id = e["id"].as_str().unwrap_or_default();
+        if id.starts_with("llm-") {
+            let Some(providers) = e["config"]["providers"].as_hash() else { continue };
+            for (name, p) in providers {
+                let Some(name) = name.as_str() else { continue };
+                for m in p["models"].as_vec().map(Vec::as_slice).unwrap_or_default() {
+                    if let Some(model) = m["id"].as_str().or_else(|| m.as_str()) {
+                        out.push(format!("{name}/{model}"));
+                    }
+                }
+            }
+        } else if id == "agent-default-model" {
+            out.extend(pair(&e["config"]));
+        } else if id == "subagent-model-selection-settings" {
+            out.extend(e["config"]["allowedModels"].as_vec().map(Vec::as_slice).unwrap_or_default().iter().filter_map(pair));
+        }
+    }
+    out
+}
+
+/// The desktop layer's provider entries (ids starting `llm-`), as written, so the headless run
+/// knows the same providers.
+fn provider_entries(patch: &str) -> String {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut open = false;
+    for line in patch.lines().map(|l| l.trim_end_matches('\r')) {
+        if line.starts_with("- ") || line == "-" {
+            blocks.push(vec![line]);
+            open = true;
+        } else if line.starts_with(' ') || line.is_empty() {
+            if open && let Some(b) = blocks.last_mut() {
+                b.push(line);
+            }
+        } else {
+            open = false;
+        }
+    }
+    let is_provider = |b: &&Vec<&str>| {
+        b.iter().any(|l| {
+            let l = l.strip_prefix("- ").or_else(|| l.strip_prefix("  ")).unwrap_or_default();
+            l.strip_prefix("id:").is_some_and(|id| id.trim().trim_matches(['"', '\'']).starts_with("llm-"))
+        })
+    };
+    blocks.iter().filter(is_provider).map(|b| b.join("\n") + "\n").collect()
+}
+
+/// The overlay in the harness's patch format: a list of loader entries. It inserts our tool server,
+/// and for a chosen model brings in the desktop profile's providers, turns the saved-key store back
+/// on (the headless profile leaves it off) and makes the model the default.
+fn overlay_yaml(mcp: Option<&McpCommand>, model: Option<&str>, desktop: &str) -> String {
     let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let args: String = mcp.args.iter().map(|a| format!("\n          - {}", q(a))).collect();
-    format!(
-        "# Craft Anything's tool server for this run. Generated; safe to delete.\n\
-         - insert:\n    \
-           - id: {OVERLAY_ID}\n      \
-             name: '@deepseek-ai/dsh-mcp-client'\n      \
-             config:\n        \
-               serverName: {OVERLAY_SERVER}\n        \
-               transport: stdio\n        \
-               command: {}\n        \
-               args:{args}\n        \
-               toolCallTimeoutMs: 300000\n",
-        q(&mcp.command)
-    )
+    let mut out = String::from("# Craft Anything's overlay for this run. Generated; safe to delete.\n");
+    if let Some(mcp) = mcp {
+        let args: String = mcp.args.iter().map(|a| format!("\n          - {}", q(a))).collect();
+        out.push_str(&format!(
+            "- insert:\n    \
+               - id: {OVERLAY_ID}\n      \
+                 name: '@deepseek-ai/dsh-mcp-client'\n      \
+                 config:\n        \
+                   serverName: {OVERLAY_SERVER}\n        \
+                   transport: stdio\n        \
+                   command: {}\n        \
+                   args:{args}\n        \
+                   toolCallTimeoutMs: 300000\n",
+            q(&mcp.command)
+        ));
+    }
+    if let Some(model) = model {
+        let (provider, name) = model.split_once('/').unwrap_or(("deepseek-official", model));
+        out.push_str(&provider_entries(desktop));
+        // The headless bundle leaves the key store off ("one-shot jobs use launch-time credentials"),
+        // so a key saved in the app is never seen; a chosen model needs it, and only then.
+        out.push_str("- id: credentials\n  disabled: false\n");
+        out.push_str(&format!(
+            "- id: agent-default-model\n  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n    provider: {}\n    model: {}\n",
+            q(provider),
+            q(name)
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -288,8 +406,50 @@ mod tests {
     #[test]
     fn quotes_are_escaped_for_yaml() {
         let mcp = McpCommand { command: "cli's.exe".into(), args: vec!["--project".into(), r"C:\it's here".into()], notes: None };
-        let y = overlay_yaml(&mcp);
+        let y = overlay_yaml(Some(&mcp), None, "");
         assert!(y.contains("command: 'cli''s.exe'"), "{y}");
         assert!(y.contains("- 'C:\\it''s here'"), "{y}");
+    }
+
+    const DESKTOP: &str = "# comment\n\
+        - id: web\n  config:\n    searchProvider: tavily\n\
+        - id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      openrouter:\n        models:\n          - id: meta/muse\n        api: openai-completions\n      claude:\n        # note\n        models:\n          - id: claude-x\n\
+        # between\n\
+        - id: agent-default-model\n  config:\n    provider: claude\n    model: claude-x\n\
+        - id: subagent-model-selection-settings\n  config:\n    allowedModels:\n      - provider: buddy\n        model: flash\n";
+
+    /// Every model the desktop profile names is offered, with its provider.
+    #[test]
+    fn desktop_models_are_listed_with_their_provider() {
+        let models = desktop_models(DESKTOP);
+        for m in ["openrouter/meta/muse", "claude/claude-x", "buddy/flash"] {
+            assert!(models.iter().any(|x| x == m), "{m} missing from {models:?}");
+        }
+        assert!(desktop_models("not: [yaml").is_empty());
+    }
+
+    /// A chosen model brings the desktop providers and becomes the default, and nothing else of
+    /// the desktop profile comes along.
+    #[test]
+    fn chosen_model_overlay_carries_providers_and_default() {
+        let y = overlay_yaml(None, Some("openrouter/meta/muse"), DESKTOP);
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).expect("overlay parses");
+        let entries = docs[0].as_vec().expect("a list");
+        let ids: Vec<&str> = entries.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"llm-pi-ai") && ids.contains(&"credentials"), "{y}");
+        assert!(!ids.contains(&"web") && !ids.contains(&"subagent-model-selection-settings"), "{y}");
+        let default = entries.iter().find(|e| e["id"].as_str() == Some("agent-default-model")).expect("default");
+        assert_eq!(default["config"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(default["config"]["model"].as_str(), Some("meta/muse"));
+    }
+
+    /// A question with a chosen model still gets the model, though no tool server.
+    #[test]
+    fn question_with_model_gets_a_patch_without_tool_server() {
+        let options = BackendOptions { cli_model: Some("deepseek-official/deepseek-v4-pro".into()), ..Default::default() };
+        let (argv, _) = args(&options, true);
+        let patch = argv.iter().position(|a| a == "--patch").map(|i| &argv[i + 1]).expect("a patch");
+        let y = std::fs::read_to_string(patch).expect("overlay written");
+        assert!(y.contains("deepseek-v4-pro") && !y.contains(OVERLAY_ID), "{y}");
     }
 }
