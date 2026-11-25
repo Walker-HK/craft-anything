@@ -18,10 +18,16 @@
 //! `$DSH_HOME`), and a chosen model travels in the same overlay, which also turns the saved-key
 //! store back on (the headless bundle leaves it off, so a key saved in the app is never seen) and
 //! borrows those providers' settings, so a run uses what the desktop app already uses.
+//! The overlay lives in the run's own folder, which the runner deletes with the run, so a copy of a
+//! key written inline in that profile does not outlive the turn that needed it.
 
 use super::*;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+/// The choice that means "pass no model, use the harness's own default". The saved text is the
+/// shared `default` marker every agent without a model of its own uses, because Settings and the
+/// CLI compare against that one; this names what it means here rather than borrowing another
+/// agent's constant.
+const OWN_DEFAULT: &str = crate::anthropic::CLAUDE_CODE_DEFAULT;
 
 /// The tool server's id inside the overlay. Distinct from the one a person may have added to their
 /// own profile by hand, so the two never replace each other.
@@ -59,11 +65,10 @@ impl AgentAdapter for DeepSeekHarness {
         // costs nothing today: questions go only to adapters that say they `answers_questions`, and
         // this one doesn't, so the runner stops before it builds these arguments.
         let mcp = (!cx.question).then_some(cx.mcp);
-        let model =
-            (!cx.question).then_some(cx.options.cli_model.as_deref()).flatten().filter(|m| !m.trim().is_empty() && *m != crate::anthropic::CLAUDE_CODE_DEFAULT);
+        let model = (!cx.question).then_some(cx.options.cli_model.as_deref()).flatten().filter(|m| !m.trim().is_empty() && *m != OWN_DEFAULT);
         if mcp.is_some() || model.is_some() {
             let desktop = model.map(|_| read_desktop_patch().unwrap_or_default()).unwrap_or_default();
-            v.extend(["--patch".into(), run_patch(&overlay_yaml(mcp, model, &desktop))]);
+            v.extend(["--patch".into(), run_patch(cx.run_dir, &overlay_yaml(mcp, model, &desktop))]);
         }
         // No task positional means stdin. Unlike `-`, this fails as a missing task on older
         // Harness versions without stdin support, rather than submitting a literal dash.
@@ -92,7 +97,7 @@ impl AgentAdapter for DeepSeekHarness {
     /// The models set up in the person's desktop Harness profile, as `provider/model`, after the
     /// headless profile's own default and the built-in DeepSeek models.
     fn model_choices(&self, config: &BackendConfig, _options: &BackendOptions) -> Result<Vec<String>, ToolError> {
-        let mut models = vec![crate::anthropic::CLAUDE_CODE_DEFAULT.to_string()];
+        let mut models = vec![OWN_DEFAULT.to_string()];
         // A harness on another machine keeps its profile there, out of reach of this list.
         let local = config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
         if local && let Some(text) = read_desktop_patch() {
@@ -108,13 +113,19 @@ impl AgentAdapter for DeepSeekHarness {
         true
     }
 
+    fn run_files(&self) -> bool {
+        true
+    }
+
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
         cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)?;
-        // The folder and the write a run uses, once, before the build starts: a temporary folder
-        // that can't take the overlay stops the build here with a fix, not part-way through one.
-        let dir = overlay_dir()?;
-        let written = craft_anything_platform::write_atomic_private(&dir.join(PROBE_FILE), b"[]\n");
-        let _ = std::fs::remove_dir_all(&dir);
+        // The write a run uses, once, before the build starts: a temporary folder that can't take
+        // the overlay stops the build here with a fix, not part-way through one. The run makes and
+        // removes its own folder; this only proves one can be written in that place.
+        let probe = std::env::temp_dir().join(format!("craft-anything-dsh-probe-{}.yml", std::process::id()));
+        let written = craft_anything_platform::write_atomic_private(&probe, b"[]\n")
+            .map_err(|e| e.with_remediation("Point TMP at a folder that can be written and has space, then start the build again.".to_string()));
+        let _ = std::fs::remove_file(&probe);
         written
     }
 }
@@ -122,48 +133,14 @@ impl AgentAdapter for DeepSeekHarness {
 /// The overlay's file name inside a run's folder.
 const OVERLAY_FILE: &str = "tool-server.yml";
 
-/// The file a preflight writes and removes to prove the folder takes one.
-const PROBE_FILE: &str = "probe.yml";
-
-/// A folder of this process's own for one run, in the system temporary folder: two builds at once
-/// never share one, and because it's owner-only nothing another user could prepare in a shared
-/// temporary folder is ever written through.
-fn overlay_dir() -> Result<std::path::PathBuf, ToolError> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("craft-anything-dsh-{}-{n}", std::process::id()));
-    // `create_dir` refuses a path that is already there, so a folder prepared beforehand is never
-    // used (`create_dir_all` would accept one).
-    private_dir().create(&dir).map_err(|e| {
-        ToolError::io(dir.display(), e).with_remediation(
-            "Free space on the drive that holds the temporary folder, or point TMP at one that can be written, then start the build again.".to_string(),
-        )
-    })?;
-    Ok(dir)
-}
-
-/// A builder for one run's own folder, owner-only from the moment it exists.
-#[cfg(unix)]
-fn private_dir() -> std::fs::DirBuilder {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let mut builder = std::fs::DirBuilder::new();
-    // Made owner-only as it's created, so it's never readable by anyone else, not even briefly.
-    builder.mode(0o700);
-    builder
-}
-
-/// A builder for one run's own folder; Windows keeps each person's temporary folder to themselves.
-#[cfg(not(unix))]
-fn private_dir() -> std::fs::DirBuilder {
-    std::fs::DirBuilder::new()
-}
-
-/// Our tool server as a patch overlay for this run. A folder that can't take it leaves the harness
-/// a path that isn't there, so the run fails at startup instead of building without the tool server
-/// it was promised; [`check_tool_server`](AgentAdapter::check_tool_server) reports the everyday
-/// causes first, with a fix.
-fn run_patch(yaml: &str) -> String {
-    let Ok(dir) = overlay_dir() else { return missing_overlay() };
+/// Our overlay for this run, in the run's own folder: the tool server it was promised, and the
+/// model it was asked for. The folder belongs to the run and is deleted with it, so an overlay
+/// that carries a key inline — a provider's `apiKey` written into the desktop profile — does not
+/// outlive the run. A run that got no folder writes none, and the harness is left the tool server
+/// it would otherwise not have; [`check_tool_server`](AgentAdapter::check_tool_server) reports the
+/// everyday causes first, with a fix.
+fn run_patch(dir: Option<&std::path::Path>, yaml: &str) -> String {
+    let Some(dir) = dir else { return missing_overlay() };
     let path = dir.join(OVERLAY_FILE);
     match craft_anything_platform::write_atomic_private(&path, yaml.as_bytes()) {
         Ok(()) => path.display().to_string(),
@@ -302,11 +279,14 @@ fn provider_entries(patch: &str) -> String {
     // It is a provider in all but name at that point: leaving it out is what breaks the run.
     let providers: Vec<usize> = texts.iter().enumerate().filter(|(i, text)| is_provider(*i, text)).map(|(i, _)| i).collect();
     let missing = |i: usize| -> Vec<String> {
-        let owned = anchors_declared_in(&texts[i]);
-        aliases_used_in(&texts[i]).into_iter().filter(|a| !owned.contains(a)).collect()
+        let Some(text) = texts.get(i) else { return Vec::new() };
+        let owned = anchors_declared_in(text);
+        aliases_used_in(text).into_iter().filter(|a| !owned.contains(a)).collect()
     };
     let wanted: std::collections::HashSet<String> = providers.iter().flat_map(|i| missing(*i)).collect();
-    let keeps = |i: usize| providers.contains(&i) || (!wanted.is_empty() && anchors_declared_in(&texts[i]).iter().any(|a| wanted.contains(a)));
+    let keeps = |i: usize| {
+        providers.contains(&i) || (!wanted.is_empty() && texts.get(i).is_some_and(|text| anchors_declared_in(text).iter().any(|a| wanted.contains(a))))
+    };
     texts.iter().enumerate().filter(|(i, _)| keeps(*i)).map(|(_, text)| text.clone() + "\n").collect()
 }
 
@@ -386,8 +366,9 @@ mod tests {
         }
     }
 
-    /// The arguments for one message, and the server they name.
-    fn args(options: &BackendOptions, question: bool) -> (Vec<String>, McpCommand) {
+    /// The arguments for one message, and the server they name, in a run's own folder as the
+    /// runner gives it. None: a run that got no folder, so nothing is written.
+    fn args_in(options: &BackendOptions, question: bool, run_dir: Option<&std::path::Path>) -> (Vec<String>, McpCommand) {
         let mcp = mcp();
         let cx = ArgsCx {
             options,
@@ -399,8 +380,27 @@ mod tests {
             reads_checked: false,
             question,
             message_file: None,
+            run_dir,
         };
         (DeepSeekHarness.args(&cx), mcp.clone())
+    }
+
+    /// A folder of this test's own, standing in for the run's.
+    fn run_dir(d: &tempfile::TempDir) -> std::path::PathBuf {
+        let dir = d.path().join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The arguments for one message, and the server they name, in a folder that stays for the
+    /// life of the process: these tests read what was written, and a real run's folder is removed
+    /// by the runner (covered by `the_overlay_lives_in_the_runs_folder_and_dies_with_it`).
+    fn args(options: &BackendOptions, question: bool) -> (Vec<String>, McpCommand) {
+        static KEPT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let d = KEPT.get_or_init(|| tempfile::tempdir().unwrap());
+        let dir = d.path().join(format!("run-{}", question as u8));
+        std::fs::create_dir_all(&dir).unwrap();
+        args_in(options, question, Some(&dir))
     }
 
     /// Only options go in argv; the task arrives on stdin after the profile starts.
@@ -432,23 +432,17 @@ mod tests {
         // A folder of the run's own, so nothing another user prepared in a shared temporary folder
         // is written through.
         let folder = path.parent().expect("a folder of its own").to_path_buf();
-        let own = format!("craft-anything-dsh-{}-", std::process::id());
-        assert!(folder.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&own)), "{folder:?}");
+        assert_eq!(folder.file_name().and_then(|n| n.to_str()), Some("run-0"), "the run's own folder, as the test gives it: {folder:?}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let bits = |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
-            assert_eq!(bits(&folder), 0o700, "folder {:o}", bits(&folder));
             assert_eq!(bits(&path), 0o600, "overlay {:o}", bits(&path));
         }
-        // Two runs never share one.
-        let (b, _) = args(&BackendOptions::default(), false);
-        let other = std::path::PathBuf::from(&b[b.iter().position(|x| x == "--patch").expect("--patch") + 1]);
-        let other_dir = other.parent().expect("a folder of its own").to_path_buf();
-        assert_ne!(folder, other_dir);
-        for dir in [folder, other_dir] {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // Two runs never share a folder: the runner makes one per run, so neither can read or
+        // overwrite the other's overlay.
+        let (a, b) = (RunDir::make().expect("a folder"), RunDir::make().expect("another folder"));
+        assert_ne!(a.0, b.0, "each run gets its own");
     }
 
     /// A folder that can't take the overlay stops the run, rather than building without the tool
@@ -536,6 +530,36 @@ mod tests {
         let default = entries.iter().find(|e| e["id"].as_str() == Some("agent-default-model")).expect("default");
         assert_eq!(default["config"]["provider"].as_str(), Some("openrouter"));
         assert_eq!(default["config"]["model"].as_str(), Some("meta/muse"));
+    }
+
+    /// The overlay is written into the run's own folder, and it is gone once the run is over: a
+    /// copy of a key written inline in the desktop profile must not outlive the turn that needed it.
+    #[test]
+    fn the_overlay_lives_in_the_runs_folder_and_dies_with_it() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = run_dir(&d);
+        let options = BackendOptions { cli_model: Some("claude/claude-x".into()), ..Default::default() };
+        let (a, _) = args_in(&options, false, Some(&dir));
+        let i = a.iter().position(|x| x == "--patch").expect("a --patch overlay");
+        let path = std::path::PathBuf::from(&a[i + 1]);
+        assert!(path.starts_with(&dir), "inside the run's folder: {path:?} vs {dir:?}");
+        assert!(path.exists(), "written when the arguments were built: {path:?}");
+        // Dropping the guard the runner keeps is what the end of a run does, a stopped run included.
+        let guard = RunDir::make().expect("a folder");
+        let folder = guard.0.clone();
+        assert!(folder.exists());
+        drop(guard);
+        assert!(!folder.exists(), "the folder and the overlay in it are gone with the run: {folder:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that was given no folder writes no file, rather than writing one somewhere it would stay.
+    #[test]
+    fn without_a_run_folder_no_overlay_is_written() {
+        let options = BackendOptions { cli_model: Some("claude/claude-x".into()), ..Default::default() };
+        let (a, _) = args_in(&options, false, None);
+        let path = std::path::PathBuf::from(&a[a.iter().position(|x| x == "--patch").expect("--patch") + 1]);
+        assert!(!path.exists(), "nothing written, and the harness is told where to look: {path:?}");
     }
 
     /// A chosen model never puts an overlay on a question's command line, so no path written here

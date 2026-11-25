@@ -1500,8 +1500,11 @@ Owner: open · Status: in progress
       tool server, which also brings those provider settings along and turns the key store back on
       (the headless bundle leaves it off, so a key saved in the app was never seen: that is the
       `MISSING_CREDENTIAL` a desktop-profile model run used to stop with). The harness has no
-      `--model` flag, so the overlay is the only route. Verified with adapter, model-list and overlay
-      tests and live turns on the desktop profile's own providers.
+      `--model` flag, so the overlay is the only route. The overlay lives in a folder of the run's
+      own and is removed with it, a stopped run included, so a key written inline in the desktop
+      profile is not left behind. Verified with adapter, model-list and overlay tests and live turns
+      on the desktop profile's own providers (DSH 0.2.2-rc.5).
+      — claimed: Walker-HK, branch feature/r2.2-dsh-model-choice
 - [x] Apply repeated client selections and aliases once, preserving their first selection order.
       — claimed: Plastic-time, branch rrfz/bugfix-r2.2-deduplicate-clients
 - [ ] `setup` writes the plain `mcp` command, so it drops an `--all-tools` an entry already has, and
